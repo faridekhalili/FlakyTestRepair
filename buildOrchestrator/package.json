@@ -1,0 +1,23 @@
+{
+  "name": "build-orchestrator",
+  "version": "1.0.0",
+  "description": "Agentic workflow that clones, sets up, and builds the projects listed in integration_tests_flakies.csv",
+  "type": "module",
+  "scripts": {
+    "bootstrap": "bash scripts/bootstrap.sh",
+    "dev": "tsx src/index.ts",
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@strands-agents/sdk": "^1.4.0",
+    "dotenv": "^17.4.2",
+    "openai": "^6.45.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3"
+  }
+}
