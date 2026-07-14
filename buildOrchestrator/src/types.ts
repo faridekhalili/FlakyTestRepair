@@ -34,6 +34,10 @@ export interface BuildOutcome {
   error?: string
   /** How many runs this task has had (this outcome is from the latest) */
   attempt: number
+  /** Token usage of this run (input+output across all model calls) */
+  tokens?: { input: number; output: number; total: number }
+  /** Number of agent loop turns this run used */
+  turns?: number
   /** Where this run's command logs live (workspace/logs/<task-id>/run-NNN) */
   logDir: string
   durationMs: number

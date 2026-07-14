@@ -1,4 +1,5 @@
-import { Agent } from '@strands-agents/sdk'
+import { Agent, SlidingWindowConversationManager } from '@strands-agents/sdk'
+import { config } from '../config.js'
 import { createModel } from '../model.js'
 import { createInspectTool } from '../tools/inspect.js'
 import { createReadFileTool } from '../tools/files.js'
@@ -75,6 +76,12 @@ CRITICAL Maven syntax rule — excluding a module from the reactor:
   and fails with "Could not find the selected project in the reactor".
   When you exclude a module, modules that depend on it may then fail — exclude
   those consumers too rather than reverting.
+  Batch exclusions: before retrying, list ALL modules of the same kind (every
+  UI/frontend module, every itests module) and exclude them in ONE command —
+  never peel one module per attempt; full builds cost minutes each.
+  And before ANY exclusion: re-read the error. If it matches a rule above
+  (protoc classifier, invalid release, missing sibling SNAPSHOT), apply that
+  rule — exclusions do not fix those.
 5. Success criterion: the test-compile / testClasses command exits 0. For huge
    multi-module repos, building the whole tree is preferred; if a single module
    is fundamentally broken (e.g. needs docker), you may exclude it with Maven
@@ -88,7 +95,14 @@ Rules:
 `.trim()
 
 export interface BuildAgentRun {
-  runTask: () => Promise<{ report?: AgentReport; finalText: string }>
+  runTask: () => Promise<{
+    report?: AgentReport
+    finalText: string
+    stoppedEarly: boolean
+    stopReason: string
+    tokens?: { input: number; output: number; total: number }
+    turns?: number
+  }>
 }
 
 /**
@@ -103,6 +117,13 @@ export function createBuildAgent(task: BuildTask, logDir: string): BuildAgentRun
     name: `build-${task.id}`,
     model: createModel(),
     printer: false,
+    // The SDK default is a 40-MESSAGE sliding window, which collides with our
+    // 40-TURN cap (a turn is ~2+ messages) and fails to trim around tool-use
+    // pairs. Make the window larger than any conversation our turn/token caps
+    // allow, so trimming never kicks in and the explicit caps stay in charge.
+    conversationManager: new SlidingWindowConversationManager({
+      windowSize: config.taskMaxTurns * 4,
+    }),
     systemPrompt: SYSTEM_PROMPT,
     tools: [
       createInspectTool(task),
@@ -120,11 +141,35 @@ export function createBuildAgent(task: BuildTask, logDir: string): BuildAgentRun
       const result = await agent.invoke(
         `Set up and build ${task.project} at commit ${task.sha}. ` +
           `The checkout is at ${task.dir}. Start with inspect_project.`,
+        {
+          // Cost guards: bound wall-clock (provider-retry spirals), total
+          // tokens (context blowups), and turns (command thrash) per task.
+          cancelSignal: AbortSignal.timeout(config.taskTimeoutMs),
+          limits: { turns: config.taskMaxTurns, totalTokens: config.taskTokenBudget },
+        },
       )
       const finalText = result.lastMessage.content
         .map((block) => ('text' in block ? block.text : ''))
         .join('')
-      return { report: getReport(), finalText }
+      const stoppedEarly = ['cancelled', 'limitTurns', 'limitTotalTokens', 'limitOutputTokens'].includes(
+        result.stopReason,
+      )
+      const invocation = result.metrics?.latestAgentInvocation
+      const tokens = invocation?.usage
+        ? {
+            input: invocation.usage.inputTokens,
+            output: invocation.usage.outputTokens,
+            total: invocation.usage.totalTokens,
+          }
+        : undefined
+      return {
+        report: getReport(),
+        finalText,
+        stoppedEarly,
+        stopReason: result.stopReason,
+        tokens,
+        turns: invocation?.cycles.length,
+      }
     },
   }
 }

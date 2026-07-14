@@ -84,13 +84,21 @@ async function runOne(task: BuildTask): Promise<BuildOutcome> {
     await prepareRepo(task)
 
     const { runTask } = createBuildAgent(task, logDir)
-    const { report, finalText } = await runTask()
+    const { report, finalText, stoppedEarly, stopReason, tokens, turns } = await runTask()
+
+    if (tokens) {
+      console.log(`    ⧗ ${turns} turns, ${(tokens.total / 1000).toFixed(0)}k tokens (${(tokens.input / 1000).toFixed(0)}k in / ${(tokens.output / 1000).toFixed(1)}k out)`)
+    }
 
     if (!report) {
       return {
         ...base,
         status: 'error',
-        error: `Agent finished without calling report_result. Final message: ${finalText.slice(0, 500)}`,
+        error: stoppedEarly
+          ? `Agent stopped by cost guard (${stopReason}) before reporting.`
+          : `Agent finished without calling report_result. Final message: ${finalText.slice(0, 500)}`,
+        tokens,
+        turns,
         durationMs: Date.now() - started,
         finishedAt: new Date().toISOString(),
       }
@@ -99,6 +107,8 @@ async function runOne(task: BuildTask): Promise<BuildOutcome> {
       ...base,
       status: report.status,
       report,
+      tokens,
+      turns,
       durationMs: Date.now() - started,
       finishedAt: new Date().toISOString(),
     }

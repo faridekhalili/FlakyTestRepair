@@ -20,6 +20,138 @@ function tail(text: string, chars: number): string {
 }
 
 /**
+ * Scan every pom.xml in the checkout for node/npm frontend plugins, so the
+ * frontend hint can name ALL the UI modules at once instead of letting the
+ * model discover them one failing multi-minute build at a time.
+ */
+const frontendModulesCache = new Map<string, string[]>()
+function findFrontendModules(rootDir: string): string[] {
+  const cached = frontendModulesCache.get(rootDir)
+  if (cached) return cached
+  const found: string[] = []
+  const walk = (dir: string) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.isDirectory()) {
+        if (entry.name === '.git' || entry.name === 'target' || entry.name === 'node_modules' || entry.name === 'src') continue
+        walk(path.join(dir, entry.name))
+      } else if (entry.name === 'pom.xml') {
+        const content = fs.readFileSync(path.join(dir, entry.name), 'utf8')
+        if (/frontend-maven-plugin|install-node-and-npm|<id>npm[ -]/.test(content)) {
+          const afterParent = content.split('</parent>').pop() ?? content
+          const m = /<artifactId>([^<]+)<\/artifactId>/.exec(afterParent)
+          if (m) found.push(m[1].trim())
+        }
+      }
+    }
+  }
+  try {
+    walk(rootDir)
+  } catch {
+    // partial scan is fine — hint degrades gracefully
+  }
+  frontendModulesCache.set(rootDir, found)
+  return found
+}
+
+interface HintContext {
+  output: string
+  projectDir: string
+  command: string
+}
+
+/**
+ * Known failure signatures → the fix, attached to the failing command's own
+ * result. Weak models ignore playbook rules buried in the system prompt but
+ * reliably act on a HINT sitting next to the error they just caused.
+ * A hint callback may return undefined to pass on the match (next rule runs).
+ */
+const HINTS: Array<{ pattern: RegExp; hint: (m: RegExpExecArray, ctx: HintContext) => string | undefined }> = [
+  {
+    // A module fails to resolve deps AFTER the agent excluded modules: it
+    // consumes one of the excluded artifacts. Grow the exclusion list.
+    pattern: /Failed to execute goal on project ([\w.-]+): Could not resolve dependencies/,
+    hint: (m, ctx) => {
+      const pl = /(?:-pl|--projects)[=\s]+['"]?([^\s'"]+)/.exec(ctx.command)
+      if (!pl || !pl[1].includes('!')) return undefined // no exclusions in play — let other rules handle it
+      return (
+        `${m[1]} depends on a module in your exclusion list. ADD '!:${m[1]}' to the SAME -pl list ` +
+        '(keep every previous exclusion) and re-run the same goal.'
+      )
+    },
+  },
+  {
+    pattern: /protoc.*osx-aarch_64|osx-aarch_64.*protoc|protoc:exe:osx-aarch_64/i,
+    hint: () =>
+      'Old protobuf has no Apple Silicon protoc. Re-run with the EXACT flag -Dos.detected.classifier=osx-x86_64 ' +
+      '(copy verbatim; no other property name works). Do NOT exclude modules for this.',
+  },
+  {
+    pattern: /invalid (?:target|source) release: (\d+)/,
+    hint: (m) =>
+      `The pom pins Java ${m[1]}. Install a JDK ${m[1]} if needed and re-run with javaVersion set to it. ` +
+      'Compiler -D flags cannot fix this. Do NOT exclude modules for this.',
+  },
+  {
+    pattern: /class file has wrong version (\d+)\.0, should be (\d+)\.0/,
+    hint: () =>
+      'Stale target/ classes from a different JDK. Add "clean" to the NEXT command only ' +
+      '(e.g. mvn clean test-compile ...), pick ONE javaVersion and stick to it, and DROP ' +
+      'clean from later commands — clean forces full rebuilds that cost minutes.',
+  },
+  {
+    pattern: /UnsupportedClassVersionError.*?class file version (\d+)\.0.*?up to (\d+)\.0/s,
+    hint: (m) =>
+      `A build plugin or dependency needs Java ${Number(m[1]) - 44}, but you are running Java ${Number(m[2]) - 44}. ` +
+      `Re-run with javaVersion set to a JDK ${Number(m[1]) - 44} (or newer). Do NOT exclude modules for this.`,
+  },
+  {
+    pattern: /Could not find the selected project in the reactor: (\S+)/,
+    hint: (m) => `"${m[1]}" is not a module path. Use the colon form: -pl '!:${m[1]}'.`,
+  },
+  {
+    pattern: /package [\w.]+\.shaded[\w.]* does not exist/,
+    hint: () =>
+      'A sibling "shaded" module must be packaged before anything can compile against it — plain ' +
+      'test-compile can never work here. Run "mvn -B -DskipTests -Dinvoker.skip=true install" ' +
+      "(and exclude genuinely broken modules with -pl '!:...' if that install fails elsewhere).",
+  },
+  {
+    pattern: /exec-maven-plugin[\s\S]{0,200}?:exec \([^)]*\) on project ([\w.-]+)/,
+    hint: (m) =>
+      `Module ${m[1]} shells out to an external command (docker, scripts, ...) that cannot run here. ` +
+      `Exclude it: -pl '!:${m[1]}' (keep your other flags).`,
+  },
+  {
+    pattern: /frontend-maven-plugin|install-node-and-npm|node-gyp|'yarn install'|Could not download Node/i,
+    hint: (_m, ctx) => {
+      const failing = /on project ([\w.-]+):/.exec(ctx.output)?.[1]
+      const mods = findFrontendModules(ctx.projectDir)
+      const list = mods.length
+        ? `This project's frontend modules are: ${mods.map((x) => `!:${x}`).join(',')} — exclude them ALL in ONE command: -pl '${mods.map((x) => `!:${x}`).join(',')}'.`
+        : "Find the failing module name(s) in the log and exclude ALL UI/frontend modules in ONE command: -pl '!:module-a,!:module-b'."
+      return `A JS/UI module (${failing ?? 'unknown'}) is failing on node/npm/yarn — irrelevant to Java tests. ${list}`
+    },
+  },
+  {
+    pattern: /Could not find artifact (\S+):(?:jar|xml|war|nar|test-jar)[^ ]*:[^ ]*SNAPSHOT/,
+    hint: () =>
+      'A sibling module in this repo produces that SNAPSHOT artifact. Run ' +
+      '"mvn -B -DskipTests -Dinvoker.skip=true install" to build and install the whole tree locally.',
+  },
+]
+
+function findHint(output: string, projectDir: string, command: string): string | undefined {
+  for (const { pattern, hint } of HINTS) {
+    const match = pattern.exec(output)
+    if (match) {
+      const result = hint(match, { output, projectDir, command })
+      if (result) return result
+    }
+  }
+  return undefined
+}
+
+/**
  * The agent's workhorse: run a shell command inside this task's checkout.
  * Full output is written to a log file; only the tail is returned to the
  * model to keep context small. An optional javaVersion switches JAVA_HOME
@@ -49,6 +181,10 @@ export function allocateRunLogDir(taskId: string): { logDir: string; attempt: nu
 
 export function createRunCommandTool(task: BuildTask, logDir: string) {
   let seq = 0
+  const seen = new Map<string, { seq: number; exitCode: number }>()
+  let consecutiveRejections = 0
+  // Concurrency interleaves console lines from different agents; tag ours.
+  const tag = `${task.project.split('/')[1]}@${task.sha.slice(0, 7)}`
 
   return tool({
     name: 'run_command',
@@ -91,19 +227,36 @@ export function createRunCommandTool(task: BuildTask, logDir: string) {
         throw new Error(`cwd must stay inside the project checkout (${task.dir})`)
       }
 
-      // Models chronically write Maven exclusions as "!module" instead of
-      // "!:artifactId"; that only works when "module" is a real directory
-      // path. Reject the broken form before Maven wastes minutes on it.
+      // Models chronically botch -pl lists: "!module" without the colon, lists
+      // that mix exclusions with bare names (which flips Maven into
+      // build-ONLY-these mode), and duplicated segments. Validate every
+      // segment before Maven wastes a build on it.
       const plMatch = /(?:^|\s)(?:-pl|--projects)[=\s]+['"]?([^\s'"]+)/.exec(command)
       if (plMatch) {
-        for (const segment of plMatch[1].split(',')) {
-          if (!segment.startsWith('!') || segment.startsWith('!:')) continue
-          const asPath = segment.slice(1)
-          if (!fs.existsSync(path.resolve(resolvedCwd, asPath))) {
+        const segments = plMatch[1].split(',').filter(Boolean)
+        const uniq = new Set(segments)
+        if (uniq.size !== segments.length) {
+          throw new Error(
+            `Your -pl list contains duplicate segments (${segments.length} entries, ${uniq.size} unique). ` +
+              'Remove the duplicates — repeating a segment does nothing.',
+          )
+        }
+        const excludes = segments.filter((s) => s.startsWith('!'))
+        if (excludes.length > 0 && excludes.length !== segments.length) {
+          throw new Error(
+            `Your -pl list mixes exclusions with bare selectors (e.g. "${segments.find((s) => !s.startsWith('!'))}"). ` +
+              'A bare selector switches Maven to build-ONLY-those-modules mode — almost never what you want. ' +
+              "Prefix EVERY segment with '!:', e.g. -pl '!:mod-a,!:mod-b'.",
+          )
+        }
+        for (const segment of segments) {
+          const body = segment.replace(/^!/, '')
+          if (body.startsWith(':')) continue // ':artifactId' selector — valid
+          if (!fs.existsSync(path.resolve(resolvedCwd, body))) {
             throw new Error(
-              `Bad -pl exclusion "${segment}": "${asPath}" is not a module directory, ` +
-                `so Maven will fail with "Could not find the selected project in the reactor". ` +
-                `To exclude by artifactId, add a colon: "!:${asPath}".`,
+              `Bad -pl segment "${segment}": "${body}" is not a module directory, so Maven will fail ` +
+                `with "Could not find the selected project in the reactor". To select by artifactId, ` +
+                `use a colon: "${segment.startsWith('!') ? '!' : ''}:${body}".`,
             )
           }
         }
@@ -124,7 +277,30 @@ export function createRunCommandTool(task: BuildTask, logDir: string) {
         }
       }
 
-      console.log(`    $ ${command}${javaVersion ? `  [java ${javaVersion}]` : ''}`)
+      // Models repeat identical failing commands verbatim; each repeat bloats
+      // the conversation for zero information. Refuse exact duplicates, and
+      // if the model keeps looping on rejections, demand it wrap up.
+      const fingerprint = `${javaVersion ?? ''}|${resolvedCwd}|${command}`
+      const prior = seen.get(fingerprint)
+      if (prior) {
+        consecutiveRejections += 1
+        console.log(`    [${tag}] ⨯ duplicate rejected (#${consecutiveRejections}): ${command.slice(0, 80)}`)
+        if (consecutiveRejections >= 3) {
+          throw new Error(
+            'You are looping: this is the third-plus consecutive duplicate command. ' +
+              'STOP running commands. Call report_result NOW with status "failure" and ' +
+              'a summary of the last real error.',
+          )
+        }
+        throw new Error(
+          `You already ran this exact command (as command #${prior.seq}, exit code ${prior.exitCode}). ` +
+            'Running it again will produce the same result. Change something (flags, JDK, excluded ' +
+            'modules) or call report_result with status "failure".',
+        )
+      }
+      consecutiveRejections = 0
+
+      console.log(`    [${tag}] $ ${command.slice(0, 160)}${javaVersion ? `  [java ${javaVersion}]` : ''}`)
       const result = await runShell(command, {
         cwd: resolvedCwd,
         timeoutMs: (timeoutSeconds ?? config.commandTimeoutMs / 1000) * 1000,
@@ -132,19 +308,24 @@ export function createRunCommandTool(task: BuildTask, logDir: string) {
       })
 
       seq += 1
+      seen.set(fingerprint, { seq, exitCode: result.exitCode })
       const logFile = path.join(logDir, `${String(seq).padStart(3, '0')}.log`)
       fs.writeFileSync(
         logFile,
         `$ ${command}\n[cwd: ${resolvedCwd}] [java: ${javaVersion ?? 'default'}] [exit: ${result.exitCode}]\n\n` +
           `--- stdout ---\n${result.stdout}\n--- stderr ---\n${result.stderr}\n`,
       )
-      console.log(`      ↳ exit ${result.exitCode} in ${(result.durationMs / 1000).toFixed(1)}s`)
+      console.log(`    [${tag}]   ↳ exit ${result.exitCode} in ${(result.durationMs / 1000).toFixed(1)}s`)
+
+      const hint = result.exitCode === 0 ? undefined : findHint(`${result.stdout}\n${result.stderr}`, task.dir, command)
+      if (hint) console.log(`    [${tag}]   💡 ${hint.slice(0, 90)}…`)
 
       return {
         exitCode: result.exitCode,
         timedOut: result.timedOut,
         durationSeconds: Math.round(result.durationMs / 1000),
         logFile,
+        ...(hint ? { HINT_READ_THIS_FIRST: hint } : {}),
         stdoutTail: tail(result.stdout, config.logTailChars),
         stderrTail: tail(result.stderr, config.logTailChars / 2),
       }

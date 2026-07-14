@@ -26,7 +26,16 @@ export const config = {
   workspaceDir: path.resolve(packageRoot, process.env.WORKSPACE_DIR ?? 'workspace'),
 
   commandTimeoutMs: Number(process.env.COMMAND_TIMEOUT_SECONDS ?? 1800) * 1000,
-  logTailChars: Number(process.env.LOG_TAIL_CHARS ?? 12000),
+  logTailChars: Number(process.env.LOG_TAIL_CHARS ?? 5000),
+
+  /** Hard wall-clock cap per task — bounds provider-retry death spirals.
+   *  Generous: big trees (nifi, cxf) legitimately need 25+ min of Maven time;
+   *  runaway cost is already bounded by the token and turn caps. */
+  taskTimeoutMs: Number(process.env.TASK_TIMEOUT_MINUTES ?? 45) * 60 * 1000,
+  /** Cumulative token cap per task (input+output across all model calls). */
+  taskTokenBudget: Number(process.env.TASK_TOKEN_BUDGET ?? 1_500_000),
+  /** Max agent loop turns per task. */
+  taskMaxTurns: Number(process.env.TASK_MAX_TURNS ?? 40),
 
   csvPath: path.resolve(packageRoot, 'integration_tests_flakies.csv'),
 } as const
